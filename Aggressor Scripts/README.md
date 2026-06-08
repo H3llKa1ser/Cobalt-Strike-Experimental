@@ -9,7 +9,7 @@ Console should print:
     #   [kerb_ops] In-process wrapper loaded. Backend: IEA (Edit the top of the .cna then reload: $KERB_BACKEND = "BOFNET";   # was "IEA")
     #   [kerb_ops] Aliases: roast, opth, ptt, kdump, kpurge
 
-## kerb_inproc.cna
+## kerb_ops_inproc.cna
 
 ### 1) Kerberoasting
 
