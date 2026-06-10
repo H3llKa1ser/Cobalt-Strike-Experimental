@@ -13,3 +13,7 @@ Use MinGW (cross-compile from Linux is the common workflow):
 ### x86
 
     i686-w64-mingw32-gcc   -c hostinfo.c -o hostinfo.x86.o -masm=intel -Wall
+
+# Resources
+
+https://hackyourmom.com/en/pryvatnist/posibnyk-z-cobaltstrike-8-beacon-object-filey/
