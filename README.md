@@ -17,3 +17,5 @@ Use MinGW (cross-compile from Linux is the common workflow):
 # Resources
 
 https://hackyourmom.com/en/pryvatnist/posibnyk-z-cobaltstrike-8-beacon-object-filey/
+
+https://cobalt-strike.github.io/community_kit/
